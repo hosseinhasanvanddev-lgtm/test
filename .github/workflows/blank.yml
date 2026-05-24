@@ -17,7 +17,7 @@ on:
 jobs:
   xray-tunnel:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(inputs.hours) * 60 }}
+    timeout-minutes: 360  # حداکثر 6 ساعت
     
     steps:
     - name: Checkout
@@ -26,7 +26,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y curl wget unzip jq uuid-runtime
+        sudo apt-get install -y curl wget unzip jq uuid-runtime qrencode
         
     - name: Install Xray
       run: |
@@ -51,6 +51,13 @@ jobs:
         # تولید نام تصادفی برای تونل
         TUNNEL_NAME="xray-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)"
         echo "tunnel_name=$TUNNEL_NAME" >> $GITHUB_OUTPUT
+        
+        # محاسبه زمان بر حسب دقیقه و ثانیه
+        HOURS=${{ github.event.inputs.hours }}
+        MINUTES=$((HOURS * 60))
+        SECONDS=$((HOURS * 3600))
+        echo "minutes=$MINUTES" >> $GITHUB_OUTPUT
+        echo "seconds=$SECONDS" >> $GITHUB_OUTPUT
         
     - name: Create Xray VMESS config
       run: |
@@ -131,7 +138,8 @@ jobs:
       id: tunnel
       run: |
         # اجرای تونل با timeout مشخص
-        timeout $(( ${{ fromJSON(inputs.hours) }} * 3600 )) \
+        TIMEOUT_SEC=${{ steps.random.outputs.seconds }}
+        timeout ${TIMEOUT_SEC} \
           cloudflared tunnel --url http://127.0.0.1:${{ steps.random.outputs.port }} \
           --no-autoupdate > tunnel.log 2>&1 &
         
@@ -243,12 +251,9 @@ jobs:
         
     - name: Show QR Code
       run: |
-        if command -v qrencode &> /dev/null; then
+        if [ -f vmess_link.txt ]; then
           echo "📱 QR Code for VMESS:"
-          qrencode -t ansiutf8 "$(cat vmess_link.txt)"
-        else
-          sudo apt-get install -y qrencode
-          qrencode -t ansiutf8 "$(cat vmess_link.txt)"
+          qrencode -t ansiutf8 < vmess_link.txt
         fi
         
     - name: Keep Tunnel Alive
@@ -256,23 +261,27 @@ jobs:
         echo "=========================================="
         echo "🟢 Tunnel is Running"
         echo "=========================================="
-        echo "Duration: ${{ inputs.hours }} hours"
+        echo "Duration: ${{ github.event.inputs.hours }} hours"
         echo "VMESS Link: $(cat vmess_link.txt)"
         echo ""
         echo "You can download config from Artifacts section"
         echo "=========================================="
         
+        # محاسبه زمان پایان
+        HOURS=${{ github.event.inputs.hours }}
+        DURATION_SEC=$((HOURS * 3600))
+        
         # نگهداری تونل تا پایان زمان
         START_TIME=$(date +%s)
-        END_TIME=$((START_TIME + ${{ fromJSON(inputs.hours) * 3600 }}))
+        END_TIME=$((START_TIME + DURATION_SEC))
         
         while [ $(date +%s) -lt $END_TIME ]; do
           REMAINING=$((END_TIME - $(date +%s)))
-          HOURS=$((REMAINING / 3600))
-          MINUTES=$(((REMAINING % 3600) / 60))
-          SECONDS=$((REMAINING % 60))
+          HOURS_REM=$((REMAINING / 3600))
+          MINUTES_REM=$(((REMAINING % 3600) / 60))
+          SECONDS_REM=$((REMAINING % 60))
           
-          echo "[$(date '+%Y-%m-%d %H:%M:%S')] Tunnel alive - Remaining: ${HOURS}h ${MINUTES}m ${SECONDS}s"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] Tunnel alive - Remaining: ${HOURS_REM}h ${MINUTES_REM}m ${SECONDS_REM}s"
           sleep 60
         done
         
