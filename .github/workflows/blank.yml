@@ -60,12 +60,16 @@ jobs:
       uses: actions/checkout@v4
       
         
-    - name: Start Xray service
+    - name: Install dependencies
       run: |
-        sudo systemctl start xray
-        sudo systemctl enable xray
-        sleep 3
-        sudo systemctl status xray --no-pager
+        sudo apt-get update
+        sudo apt-get install -y curl wget unzip jq uuid-runtime qrencode
+        
+    - name: Install Xray with sudo
+      run: |
+        # نصب Xray با دسترسی sudo
+        sudo bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+        
         
     - name: Install cloudflared
       run: |
