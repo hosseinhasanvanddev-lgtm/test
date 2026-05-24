@@ -1,0 +1,290 @@
+name: Create Xray VMESS Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'مدت زمان تونل (ساعت)'
+        required: false
+        default: '6'
+        type: choice
+        options:
+        - '1'
+        - '2'
+        - '4'
+        - '6'
+
+jobs:
+  xray-tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.hours) * 60 }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl wget unzip jq uuid-runtime
+        
+    - name: Install Xray
+      run: |
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+        mkdir -p ~/xray-config
+        
+    - name: Generate random configurations
+      id: random
+      run: |
+        # تولید UUID تصادفی
+        UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+        echo "uuid=$UUID" >> $GITHUB_OUTPUT
+        
+        # تولید مسیر تصادفی برای WebSocket
+        PATH_RANDOM=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 12 | head -n 1)
+        echo "path=/$PATH_RANDOM" >> $GITHUB_OUTPUT
+        
+        # تولید پورت تصادفی داخلی
+        PORT=$(shuf -i 10000-65535 -n 1)
+        echo "port=$PORT" >> $GITHUB_OUTPUT
+        
+        # تولید نام تصادفی برای تونل
+        TUNNEL_NAME="xray-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)"
+        echo "tunnel_name=$TUNNEL_NAME" >> $GITHUB_OUTPUT
+        
+    - name: Create Xray VMESS config
+      run: |
+        cat > ~/xray-config/config.json << EOF
+        {
+          "log": {
+            "loglevel": "warning"
+          },
+          "inbounds": [
+            {
+              "listen": "127.0.0.1",
+              "port": ${{ steps.random.outputs.port }},
+              "protocol": "vmess",
+              "settings": {
+                "clients": [
+                  {
+                    "id": "${{ steps.random.outputs.uuid }}",
+                    "alterId": 0,
+                    "security": "auto"
+                  }
+                ]
+              },
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                  "path": "${{ steps.random.outputs.path }}",
+                  "headers": {
+                    "Host": "cloudflare.com"
+                  }
+                }
+              },
+              "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls"]
+              }
+            }
+          ],
+          "outbounds": [
+            {
+              "protocol": "freedom",
+              "tag": "direct"
+            },
+            {
+              "protocol": "blackhole",
+              "tag": "block"
+            }
+          ],
+          "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+              {
+                "type": "field",
+                "ip": ["geoip:private"],
+                "outboundTag": "block"
+              }
+            ]
+          }
+        }
+        EOF
+        
+    - name: Install cloudflared
+      run: |
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        chmod +x cloudflared-linux-amd64
+        sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+        
+    - name: Start Xray
+      run: |
+        sudo cp ~/xray-config/config.json /usr/local/etc/xray/config.json
+        sudo systemctl start xray
+        sudo systemctl enable xray
+        sleep 3
+        
+        # بررسی وضعیت Xray
+        sudo systemctl status xray --no-pager
+        
+    - name: Create Cloudflare Tunnel
+      id: tunnel
+      run: |
+        # اجرای تونل با timeout مشخص
+        timeout $(( ${{ fromJSON(inputs.hours) }} * 3600 )) \
+          cloudflared tunnel --url http://127.0.0.1:${{ steps.random.outputs.port }} \
+          --no-autoupdate > tunnel.log 2>&1 &
+        
+        TUNNEL_PID=$!
+        echo "tunnel_pid=$TUNNEL_PID" >> $GITHUB_OUTPUT
+        
+        # انتظار برای ایجاد تونل
+        sleep 8
+        
+        # استخراج آدرس تونل
+        TUNNEL_URL=$(grep -o 'https://[a-z0-9.-]*\.trycloudflare.com' tunnel.log | head -1)
+        
+        if [ -z "$TUNNEL_URL" ]; then
+          echo "Failed to get tunnel URL"
+          cat tunnel.log
+          exit 1
+        fi
+        
+        echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+        echo "Tunnel URL: $TUNNEL_URL"
+        
+        # ذخیره آدرس در فایل
+        echo "$TUNNEL_URL" > tunnel_url.txt
+        echo "${{ steps.random.outputs.uuid }}" > uuid.txt
+        echo "${{ steps.random.outputs.path }}" > path.txt
+        
+    - name: Generate VMESS Link
+      id: vmess
+      run: |
+        TUNNEL_URL=$(cat tunnel_url.txt)
+        DOMAIN=$(echo $TUNNEL_URL | sed 's|https://||')
+        UUID=$(cat uuid.txt)
+        PATH_VMESS=$(cat path.txt)
+        
+        # ساخت لینک vmess
+        VMESS_CONFIG=$(jq -n \
+          --arg v "2" \
+          --arg ps "GitHub-Xray-Tunnel" \
+          --arg add "$DOMAIN" \
+          --arg port "443" \
+          --arg id "$UUID" \
+          --arg aid "0" \
+          --arg net "ws" \
+          --arg type "none" \
+          --arg host "cloudflare.com" \
+          --arg path "$PATH_VMESS" \
+          --arg tls "tls" \
+          '{v: $v, ps: $ps, add: $add, port: $port, id: $id, aid: $aid, net: $net, type: $type, host: $host, path: $path, tls: $tls}')
+        
+        VMESS_LINK="vmess://$(echo -n $VMESS_CONFIG | base64 -w 0)"
+        echo "vmess_link=$VMESS_LINK" >> $GITHUB_OUTPUT
+        echo "$VMESS_LINK" > vmess_link.txt
+        
+        echo "=========================================="
+        echo "✅ Xray VMESS Tunnel Created Successfully"
+        echo "=========================================="
+        echo ""
+        echo "📡 VMESS Link (Copy this):"
+        echo "$VMESS_LINK"
+        echo ""
+        echo "📋 Details:"
+        echo "   Address: $DOMAIN"
+        echo "   Port: 443"
+        echo "   UUID: $UUID"
+        echo "   Path: $PATH_VMESS"
+        echo "   Security: tls"
+        echo "   Network: ws"
+        echo ""
+        
+        # ساخت کانفیگ JSON برای کلاینت
+        cat > client-config.json << EOF
+        {
+          "outbounds": [
+            {
+              "protocol": "vmess",
+              "settings": {
+                "vnext": [
+                  {
+                    "address": "$DOMAIN",
+                    "port": 443,
+                    "users": [
+                      {
+                        "id": "$UUID",
+                        "alterId": 0,
+                        "security": "auto"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                  "allowInsecure": false,
+                  "serverName": "cloudflare.com"
+                },
+                "wsSettings": {
+                  "path": "$PATH_VMESS",
+                  "headers": {
+                    "Host": "cloudflare.com"
+                  }
+                }
+              }
+            }
+          ]
+        }
+        EOF
+        
+    - name: Show QR Code
+      run: |
+        if command -v qrencode &> /dev/null; then
+          echo "📱 QR Code for VMESS:"
+          qrencode -t ansiutf8 "$(cat vmess_link.txt)"
+        else
+          sudo apt-get install -y qrencode
+          qrencode -t ansiutf8 "$(cat vmess_link.txt)"
+        fi
+        
+    - name: Keep Tunnel Alive
+      run: |
+        echo "=========================================="
+        echo "🟢 Tunnel is Running"
+        echo "=========================================="
+        echo "Duration: ${{ inputs.hours }} hours"
+        echo "VMESS Link: $(cat vmess_link.txt)"
+        echo ""
+        echo "You can download config from Artifacts section"
+        echo "=========================================="
+        
+        # نگهداری تونل تا پایان زمان
+        START_TIME=$(date +%s)
+        END_TIME=$((START_TIME + ${{ fromJSON(inputs.hours) * 3600 }}))
+        
+        while [ $(date +%s) -lt $END_TIME ]; do
+          REMAINING=$((END_TIME - $(date +%s)))
+          HOURS=$((REMAINING / 3600))
+          MINUTES=$(((REMAINING % 3600) / 60))
+          SECONDS=$((REMAINING % 60))
+          
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] Tunnel alive - Remaining: ${HOURS}h ${MINUTES}m ${SECONDS}s"
+          sleep 60
+        done
+        
+    - name: Upload Artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: xray-configs
+        path: |
+          client-config.json
+          vmess_link.txt
+          tunnel_url.txt
+          uuid.txt
+          path.txt
+        retention-days: 1
