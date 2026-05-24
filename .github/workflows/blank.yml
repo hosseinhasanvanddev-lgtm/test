@@ -1,40 +1,41 @@
-name: Create Temporary Tunnel for V2Ray
+name: Xray VMESS Tunnel with Docker
 
 on:
-  workflow_dispatch:  # اجرای دستی
+  workflow_dispatch:
 
 jobs:
-  tunnel:
+  xray-tunnel:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # حداکثر 6 ساعت اجرا
+    timeout-minutes: 360
     
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y curl wget unzip jq
+        sudo apt-get install -y jq uuid-runtime qrencode curl
         
-    - name: Install cloudflared
+    - name: Generate configs
+      id: config
       run: |
-        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-        chmod +x cloudflared-linux-amd64
-        sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+        UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+        PATH_RANDOM=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 12 | head -n 1)
+        PORT=10000
         
-    - name: Create V2Ray config
-      run: |
-        cat > v2ray-config.json << 'EOF'
+        echo "uuid=$UUID" >> $GITHUB_OUTPUT
+        echo "path=/$PATH_RANDOM" >> $GITHUB_OUTPUT
+        echo "port=$PORT" >> $GITHUB_OUTPUT
+        
+        # ساخت کانفیگ Xray
+        cat > config.json << EOF
         {
           "inbounds": [
             {
-              "port": 10000,
+              "port": $PORT,
               "protocol": "vmess",
               "settings": {
                 "clients": [
                   {
-                    "id": "UUID_PLACEHOLDER",
+                    "id": "$UUID",
                     "alterId": 0
                   }
                 ]
@@ -42,119 +43,82 @@ jobs:
               "streamSettings": {
                 "network": "ws",
                 "wsSettings": {
-                  "path": "/ray"
+                  "path": "/$PATH_RANDOM"
                 }
               }
             }
           ],
           "outbounds": [
             {
-              "protocol": "freedom",
-              "settings": {}
+              "protocol": "freedom"
             }
           ]
         }
         EOF
         
-    - name: Generate UUID
-      id: uuid
+    - name: Run Xray with Docker
       run: |
-        UUID=$(cat /proc/sys/kernel/random/uuid)
-        sed -i "s/UUID_PLACEHOLDER/$UUID/g" v2ray-config.json
-        echo "uuid=$UUID" >> $GITHUB_OUTPUT
+        docker run -d \
+          --name xray \
+          -p ${{ steps.config.outputs.port }}:${{ steps.config.outputs.port }} \
+          -v $(pwd)/config.json:/etc/xray/config.json \
+          teddysun/xray:latest
         
-    - name: Setup V2Ray
+        sleep 3
+        docker ps
+        
+    - name: Install cloudflared
       run: |
-        bash <(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)
-        sudo cp v2ray-config.json /usr/local/etc/v2ray/config.json
-        sudo systemctl start v2ray
-        sudo systemctl enable v2ray
+        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+        chmod +x cloudflared
+        sudo mv cloudflared /usr/local/bin/
         
-    - name: Create Cloudflare Tunnel
-      id: tunnel
+    - name: Create tunnel
       run: |
-        # ایجاد تونل به پورت 10000
-        cloudflared tunnel --url http://localhost:10000 --no-autoupdate > tunnel.log 2>&1 &
-        sleep 5
+        cloudflared tunnel --url http://localhost:${{ steps.config.outputs.port }} --no-autoupdate > tunnel.log 2>&1 &
+        sleep 10
         
-        # استخراج آدرس تونل
         TUNNEL_URL=$(grep -o 'https://[a-z0-9.-]*\.trycloudflare.com' tunnel.log | head -1)
-        echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+        DOMAIN=$(echo $TUNNEL_URL | sed 's|https://||')
+        
         echo "Tunnel URL: $TUNNEL_URL"
         
-        # ذخیره آدرس در فایل
-        echo $TUNNEL_URL > tunnel_url.txt
+        # ساخت لینک VMESS
+        VMESS_JSON=$(jq -n \
+          --arg v "2" \
+          --arg ps "Docker-Xray-Tunnel" \
+          --arg add "$DOMAIN" \
+          --arg port "443" \
+          --arg id "${{ steps.config.outputs.uuid }}" \
+          --arg aid "0" \
+          --arg net "ws" \
+          --arg path "${{ steps.config.outputs.path }}" \
+          --arg tls "tls" \
+          '{v: $v, ps: $ps, add: $add, port: $port, id: $id, aid: $aid, net: $net, path: $path, tls: $tls}')
         
-    - name: Display V2Ray Configuration
-      run: |
-        TUNNEL_URL=$(cat tunnel_url.txt)
-        UUID=$(echo "${{ steps.uuid.outputs.uuid }}")
+        VMESS_LINK="vmess://$(echo -n $VMESS_JSON | base64 -w 0)"
         
         echo "=========================================="
-        echo "V2Ray Configuration for Client:"
-        echo "=========================================="
-        echo "Address: ${TUNNEL_URL#https://}"
-        echo "Port: 443"
-        echo "UUID: $UUID"
-        echo "AlterID: 0"
-        echo "Security: auto"
-        echo "Network: ws"
-        echo "Path: /ray"
+        echo "VMESS Link:"
+        echo "$VMESS_LINK"
         echo "=========================================="
         
-        # ایجاد فایل کانفیگ V2Ray برای کلاینت
-        cat > client-config.json << EOF
-        {
-          "outbounds": [
-            {
-              "protocol": "vmess",
-              "settings": {
-                "vnext": [
-                  {
-                    "address": "${TUNNEL_URL#https://}",
-                    "port": 443,
-                    "users": [
-                      {
-                        "id": "$UUID",
-                        "alterId": 0,
-                        "security": "auto"
-                      }
-                    ]
-                  }
-                ]
-              },
-              "streamSettings": {
-                "network": "ws",
-                "security": "tls",
-                "wsSettings": {
-                  "path": "/ray"
-                }
-              }
-            }
-          ]
-        }
-        EOF
+        echo "$VMESS_LINK" > vmess_link.txt
+        echo "$TUNNEL_URL" > tunnel_url.txt
         
-        echo "Client config saved to client-config.json"
+        # نمایش QR Code
+        qrencode -t ansiutf8 "$VMESS_LINK"
         
-    - name: Keep tunnel alive
-      run: |
-        # نگه‌داشتن تونل تا پایان زمان
-        echo "Tunnel is running. Check GitHub Actions log for configuration."
-        echo "Tunnel URL: $(cat tunnel_url.txt)"
-        echo "UUID: ${{ steps.uuid.outputs.uuid }}"
+        # نگهداری تونل
+        sleep 21600
         
-        # نمایش لاگ تونل هر 60 ثانیه
-        while true; do
-          sleep 60
-          echo "Tunnel still alive... (running for $SECONDS seconds)"
-        done
-        
-    - name: Upload config artifacts
+    - name: Upload artifacts
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: v2ray-config
+        name: configs
         path: |
-          client-config.json
+          vmess_link.txt
           tunnel_url.txt
+          config.json
+        retention-days: 1
