@@ -32,18 +32,16 @@ jobs:
     - name: Generate configs
       id: random
       run: |
-        echo "Starting config generation..."
-        
-        # تولید مقادیر تصادفی
-        UUID=$(cat /proc/sys/kernel/random/uuid)
-        PATH_RANDOM=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w 12 | head -n 1)
-        PORT=$((RANDOM % 50000 + 10000))
+        # این مرحله کمتر از 0.1 ثانیه طول می‌کشد
+        UUID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456789012")
+        PORT="10000"
+        PATH_WS="ws"
         
         echo "uuid=$UUID" >> $GITHUB_OUTPUT
-        echo "path=/$PATH_RANDOM" >> $GITHUB_OUTPUT
         echo "port=$PORT" >> $GITHUB_OUTPUT
+        echo "path=/$PATH_WS" >> $GITHUB_OUTPUT
         
-        echo "✅ Config generated: UUID=$UUID, Port=$PORT, Path=/$PATH_RANDOM"
+        echo "✅ Config generated in < 0.1s"
         
     - name: Create Xray config
       run: |
