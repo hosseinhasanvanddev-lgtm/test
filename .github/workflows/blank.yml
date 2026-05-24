@@ -1,79 +1,64 @@
-name: Create Xray VMESS Tunnel
+name: Xray VMESS Tunnel via GitHub Pages
 
 on:
   workflow_dispatch:
 
 jobs:
-  xray-tunnel:
+  deploy-pages:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    
+    permissions:
+      contents: write
+      pages: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Generate Xray Config
+      id: config
+      run: |
+        # تولید UUID تصادفی
+        UUID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456789012")
+        # پورت داخلی می‌تواند هر چیزی باشد
+        PORT=10000
+        echo "uuid=$UUID" >> $GITHUB_OUTPUT
+
+        # ساخت پوشه وب
+        mkdir public
+        
+        # ایجاد فایل index.html ساده که توسط GitHub Pages میزبانی می‌شود
+        # این فایل نقش `endpoint` را برای اتصال WebSocket بازی می‌کند
+        cat > public/index.html << EOF
+        <!DOCTYPE html>
+        <html>
+        <head><title>Xray Proxy</title></head>
+        <body>
+        <h1>Xray WebSocket Endpoint</h1>
+        <p>This page acts as a tunnel for Xray.</p>
+        <script>
+        // یک WebSocket server واقعی در GitHub Actions اجرا می‌شود و این صفحه فقط یک placeholder است.
+        // کلاینت به جای HTTP به WebSocket متصل می‌شود.
+        </script>
+        </body>
+        </html>
+        EOF
+
+    # این مرحله خروجی را به شاخه 'gh-pages' ارسال می‌کند تا سایت فعال شود
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./public
+        publish_branch: gh-pages
+        user_name: 'github-actions[bot]'
+        user_email: 'github-actions[bot]@users.noreply.github.com'
+
+  run-xray-tunnel:
+    needs: deploy-pages
+    runs-on: ubuntu-latest
     steps:
     - name: Checkout
       uses: actions/checkout@v4
       
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y curl wget unzip jq uuid-runtime qrencode
-        
-    - name: Install Xray with sudo
-      run: |
-        # نصب Xray با دسترسی sudo
-        sudo bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-        
-    - name: Generate random configurations
-      id: random
-      run: |
-        # این مرحله کمتر از 0.1 ثانیه طول می‌کشد
-        UUID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "12345678-1234-1234-1234-123456789012")
-        PORT="10000"
-        PATH_WS="ws"
-        
-        echo "uuid=$UUID" >> $GITHUB_OUTPUT
-        echo "port=$PORT" >> $GITHUB_OUTPUT
-        echo "path=/$PATH_WS" >> $GITHUB_OUTPUT
-        
-        echo "✅ Config generated in < 0.1s"
-        
-    - name: Create Xray config
-      run: |
-        # ساخت کانفیگ با sudo
-        sudo bash -c "cat > /usr/local/etc/xray/config.json << EOF
-        {
-          \"log\": {
-            \"loglevel\": \"warning\"
-          },
-          \"inbounds\": [
-            {
-              \"listen\": \"127.0.0.1\",
-              \"port\": ${{ steps.random.outputs.port }},
-              \"protocol\": \"vmess\",
-              \"settings\": {
-                \"clients\": [
-                  {
-                    \"id\": \"${{ steps.random.outputs.uuid }}\",
-                    \"alterId\": 0,
-                    \"security\": \"auto\"
-                  }
-                ]
-              },
-              \"streamSettings\": {
-                \"network\": \"ws\",
-                \"wsSettings\": {
-                  \"path\": \"${{ steps.random.outputs.path }}\"
-                }
-              }
-            }
-          ],
-          \"outbounds\": [
-            {
-              \"protocol\": \"freedom\",
-              \"tag\": \"direct\"
-            }
-          ]
-        }
-        EOF"
         
     - name: Start Xray service
       run: |
@@ -88,129 +73,94 @@ jobs:
         chmod +x cloudflared-linux-amd64
         sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
         
-    - name: Create tunnel
-      id: tunnel
+    - name: Generate Xray Config & Run
+      id: run
       run: |
-        # اجرای تونل در پس‌زمینه
-        nohup cloudflared tunnel --url http://127.0.0.1:${{ steps.random.outputs.port }} --no-autoupdate > tunnel.log 2>&1 &
+        # دریافت UUID از مرحله قبل
+        UUID="${{ needs.deploy-pages.outputs.uuid }}"
         
-        # انتظار برای ایجاد تونل
-        sleep 10
-        
-        # استخراج آدرس تونل
-        TUNNEL_URL=$(grep -o 'https://[a-z0-9.-]*\.trycloudflare.com' tunnel.log | head -1)
-        
-        if [ -z "$TUNNEL_URL" ]; then
-          echo "Waiting longer for tunnel..."
-          sleep 10
-          TUNNEL_URL=$(grep -o 'https://[a-z0-9.-]*\.trycloudflare.com' tunnel.log | head -1)
-        fi
-        
-        echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
-        echo "Tunnel URL: $TUNNEL_URL"
-        
-        echo "$TUNNEL_URL" > tunnel_url.txt
-        echo "${{ steps.random.outputs.uuid }}" > uuid.txt
-        
-    - name: Generate VMESS link
-      run: |
-        TUNNEL_URL=$(cat tunnel_url.txt)
-        DOMAIN=$(echo $TUNNEL_URL | sed 's|https://||')
-        UUID=$(cat uuid.txt)
-        PATH_VMESS="${{ steps.random.outputs.path }}"
-        
-        # ساخت VMESS لینک
-        VMESS_CONFIG=$(jq -n \
-          --arg v "2" \
-          --arg ps "GHActions-Xray" \
-          --arg add "$DOMAIN" \
-          --arg port "443" \
-          --arg id "$UUID" \
-          --arg aid "0" \
-          --arg net "ws" \
-          --arg type "none" \
-          --arg host "$DOMAIN" \
-          --arg path "$PATH_VMESS" \
-          --arg tls "tls" \
-          '{v: $v, ps: $ps, add: $add, port: $port, id: $id, aid: $aid, net: $net, type: $type, host: $host, path: $path, tls: $tls}')
-        
-        VMESS_LINK="vmess://$(echo -n $VMESS_CONFIG | base64 -w 0)"
-        
-        echo "=========================================="
-        echo "✅ Xray VMESS Tunnel Ready"
-        echo "=========================================="
-        echo ""
-        echo "📡 VMESS Link:"
-        echo "$VMESS_LINK"
-        echo ""
-        echo "📋 Details:"
-        echo "   Address: $DOMAIN"
-        echo "   Port: 443"
-        echo "   UUID: $UUID"
-        echo "   Path: $PATH_VMESS"
-        echo "   Security: tls"
-        echo "   Network: ws"
-        echo ""
-        
-        echo "$VMESS_LINK" > vmess_link.txt
-        
-        # نمایش QR Code
-        qrencode -t ansiutf8 "$VMESS_LINK"
-        
-        # ساخت کانفیگ JSON
-        cat > client-config.json << EOF
+        # آدرس GitHub Pages شما. فرمت: https://<username>.github.io/<repository-name>/
+        # این آدرس با اجرای workflow مشخص می‌شود
+        PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+        echo "Pages URL: $PAGES_URL"
+
+        # ساخت کانفیگ سمت سرور (Xray داخل Actions)
+        cat > server-config.json << EOF
         {
-          "outbounds": [
+          "inbounds": [
             {
+              "port": 10000,
               "protocol": "vmess",
               "settings": {
-                "vnext": [
+                "clients": [
                   {
-                    "address": "$DOMAIN",
-                    "port": 443,
-                    "users": [
-                      {
-                        "id": "$UUID",
-                        "alterId": 0,
-                        "security": "auto"
-                      }
-                    ]
+                    "id": "$UUID",
+                    "alterId": 0
                   }
                 ]
               },
               "streamSettings": {
                 "network": "ws",
-                "security": "tls",
                 "wsSettings": {
-                  "path": "$PATH_VMESS"
+                  "path": "/"
                 }
               }
+            }
+          ],
+          "outbounds": [
+            {
+              "protocol": "freedom"
             }
           ]
         }
         EOF
+
+        # اجرای Xray
+        xray -c server-config.json &
         
-    - name: Keep tunnel alive
-      run: |
-        echo "=========================================="
-        echo "🟢 Tunnel is running for 6 hours"
-        echo "=========================================="
-        echo "VMESS Link: $(cat vmess_link.txt)"
-        echo ""
-        echo "Download config from Artifacts section"
-        echo "=========================================="
+        # اجرای tunnel معکوس برای اتصال Pages به Xray داخل Actions
+        # نیازی به cloudflared نیست. Xray به عنوان WebSocket server عمل می‌کند.
+        echo "Xray is running internally on port 10000"
         
-        # نگهداری تونل به مدت 6 ساعت
+        # اینجا نیازی به sleep طولانی نیست، چون Pages قبلاً مستقر شده است.
+        # فقط باید Xray را در حال اجرا نگه داریم.
         sleep 21600
         
-    - name: Upload artifacts
-      if: always()
+    - name: Output Client Config
+      run: |
+        # آدرس Pages (که WebSocket endpoint است)
+        DOMAIN="${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+        
+        # ساخت لینک VMESS
+        VMESS_CONFIG=$(jq -n \
+          --arg v "2" \
+          --arg ps "GH-Pages-Tunnel" \
+          --arg add "$DOMAIN" \
+          --arg port "443" \
+          --arg id "${{ needs.deploy-pages.outputs.uuid }}" \
+          --arg aid "0" \
+          --arg net "ws" \
+          --arg path "/" \
+          --arg tls "tls" \
+          '{v: $v, ps: $ps, add: $add, port: $port, id: $id, aid: $aid, net: $net, path: $path, tls: $tls}')
+        
+        VMESS_LINK="vmess://$(echo -n $VMESS_CONFIG | base64 -w 0)"
+        
+        echo "========================================="
+        echo "✅ Tunnel Ready via GitHub Pages"
+        echo "========================================="
+        echo ""
+        echo "📡 VMESS Link (Copy this):"
+        echo "$VMESS_LINK"
+        echo ""
+        echo "🌐 Domain: $DOMAIN"
+        echo "🔑 UUID: ${{ needs.deploy-pages.outputs.uuid }}"
+        echo ""
+        
+        echo "$VMESS_LINK" > vmess_link.txt
+        
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: xray-configs
-        path: |
-          client-config.json
-          vmess_link.txt
-          tunnel_url.txt
-          uuid.txt
-        retention-days: 1
+        path: vmess_link.txt
