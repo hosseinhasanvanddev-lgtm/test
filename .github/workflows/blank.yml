@@ -1,7 +1,5 @@
-name: Xray VMESS Tunnel with Docker
+name: Xray VMESS Tunnel - Fixed
 
-on:
-  workflow_dispatch:
 
 jobs:
   xray-tunnel:
@@ -12,30 +10,61 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq uuid-runtime qrencode curl
+        sudo apt-get install -y curl wget unzip jq uuid-runtime qrencode socat
+        
+    - name: Install Xray (Alternative method)
+      run: |
+        # روش جایگزین برای نصب Xray
+        curl -L https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o Xray.zip
+        unzip Xray.zip -d xray_temp
+        sudo mkdir -p /usr/local/share/xray /usr/local/etc/xray
+        sudo cp xray_temp/xray /usr/local/bin/
+        sudo cp xray_temp/geoip.dat /usr/local/share/xray/
+        sudo cp xray_temp/geosite.dat /usr/local/share/xray/
+        sudo chmod +x /usr/local/bin/xray
+        rm -rf Xray.zip xray_temp
+        
+        # بررسی نصب
+        /usr/local/bin/xray -version
         
     - name: Generate configs
-      id: config
+      id: random
       run: |
-        UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
-        PATH_RANDOM=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 12 | head -n 1)
-        PORT=10000
+        echo "Starting config generation..."
+        
+        # تولید مقادیر تصادفی
+        UUID=$(cat /proc/sys/kernel/random/uuid)
+        PATH_RANDOM=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w 12 | head -n 1)
+        PORT=$((RANDOM % 50000 + 10000))
         
         echo "uuid=$UUID" >> $GITHUB_OUTPUT
         echo "path=/$PATH_RANDOM" >> $GITHUB_OUTPUT
         echo "port=$PORT" >> $GITHUB_OUTPUT
         
-        # ساخت کانفیگ Xray
-        cat > config.json << EOF
+        echo "✅ Config generated: UUID=$UUID, Port=$PORT, Path=/$PATH_RANDOM"
+        
+    - name: Create Xray config
+      run: |
+        # ایجاد پوشه کانفیگ
+        sudo mkdir -p /usr/local/etc/xray
+        
+        # نوشتن کانفیگ
+        sudo tee /usr/local/etc/xray/config.json > /dev/null << EOF
         {
+          "log": {
+            "loglevel": "warning",
+            "access": "/dev/null",
+            "error": "/dev/null"
+          },
           "inbounds": [
             {
-              "port": $PORT,
+              "listen": "127.0.0.1",
+              "port": ${{ steps.random.outputs.port }},
               "protocol": "vmess",
               "settings": {
                 "clients": [
                   {
-                    "id": "$UUID",
+                    "id": "${{ steps.random.outputs.uuid }}",
                     "alterId": 0
                   }
                 ]
@@ -43,7 +72,7 @@ jobs:
               "streamSettings": {
                 "network": "ws",
                 "wsSettings": {
-                  "path": "/$PATH_RANDOM"
+                  "path": "${{ steps.random.outputs.path }}"
                 }
               }
             }
@@ -56,69 +85,21 @@ jobs:
         }
         EOF
         
-    - name: Run Xray with Docker
-      run: |
-        docker run -d \
-          --name xray \
-          -p ${{ steps.config.outputs.port }}:${{ steps.config.outputs.port }} \
-          -v $(pwd)/config.json:/etc/xray/config.json \
-          teddysun/xray:latest
+        echo "✅ Xray config created successfully"
+        cat /usr/local/etc/xray/config.json | jq .
         
+    - name: Run Xray
+      run: |
+        # اجرای Xray به صورت مستقیم
+        sudo /usr/local/bin/xray -c /usr/local/etc/xray/config.json &
+        XRAY_PID=$!
+        echo "xray_pid=$XRAY_PID" >> $GITHUB_OUTPUT
         sleep 3
-        docker ps
         
-    - name: Install cloudflared
-      run: |
-        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-        chmod +x cloudflared
-        sudo mv cloudflared /usr/local/bin/
-        
-    - name: Create tunnel
-      run: |
-        cloudflared tunnel --url http://localhost:${{ steps.config.outputs.port }} --no-autoupdate > tunnel.log 2>&1 &
-        sleep 10
-        
-        TUNNEL_URL=$(grep -o 'https://[a-z0-9.-]*\.trycloudflare.com' tunnel.log | head -1)
-        DOMAIN=$(echo $TUNNEL_URL | sed 's|https://||')
-        
-        echo "Tunnel URL: $TUNNEL_URL"
-        
-        # ساخت لینک VMESS
-        VMESS_JSON=$(jq -n \
-          --arg v "2" \
-          --arg ps "Docker-Xray-Tunnel" \
-          --arg add "$DOMAIN" \
-          --arg port "443" \
-          --arg id "${{ steps.config.outputs.uuid }}" \
-          --arg aid "0" \
-          --arg net "ws" \
-          --arg path "${{ steps.config.outputs.path }}" \
-          --arg tls "tls" \
-          '{v: $v, ps: $ps, add: $add, port: $port, id: $id, aid: $aid, net: $net, path: $path, tls: $tls}')
-        
-        VMESS_LINK="vmess://$(echo -n $VMESS_JSON | base64 -w 0)"
-        
-        echo "=========================================="
-        echo "VMESS Link:"
-        echo "$VMESS_LINK"
-        echo "=========================================="
-        
-        echo "$VMESS_LINK" > vmess_link.txt
-        echo "$TUNNEL_URL" > tunnel_url.txt
-        
-        # نمایش QR Code
-        qrencode -t ansiutf8 "$VMESS_LINK"
-        
-        # نگهداری تونل
-        sleep 21600
-        
-    - name: Upload artifacts
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: configs
-        path: |
-          vmess_link.txt
-          tunnel_url.txt
-          config.json
-        retention-days: 1
+        # بررسی اجرای Xray
+        if ps -p $XRAY_PID > /dev/null; then
+          echo "✅ Xray is running (PID: $XRAY_PID)"
+        else
+          echo "❌ Xray failed to start"
+          exit 1
+        fi
