@@ -7,6 +7,10 @@ jobs:
   tunnel:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: write
+      pages: write
+      actions: read
     
     steps:
     - name: Setup
@@ -18,14 +22,18 @@ jobs:
         sudo chmod +x /usr/local/bin/xray
         rm -rf Xray.zip xray
         
+        # نصب ابزارهای مورد نیاز
+        sudo apt-get update
+        sudo apt-get install -y jq qrencode
+        
     - name: Generate Config
       id: config
       run: |
-        # UUID ثابت برای تست (می‌توانید تغییر دهید)
+        # UUID ثابت برای تست
         UUID="8a4b5c6d-7e8f-9a0b-1c2d-3e4f5a6b7c8d"
         echo "uuid=$UUID" >> $GITHUB_OUTPUT
         
-        # کانفیگ ساده
+        # کانفیگ ساده سرور
         cat > config.json << EOF
         {
           "inbounds": [{
@@ -43,44 +51,140 @@ jobs:
         }
         EOF
         
+        echo "✅ Config created"
+        
     - name: Run Xray
       run: |
-        /usr/local/bin/xray run -c config.json &
-        sleep 3
+        /usr/local/bin/xray run -c config.json > xray.log 2>&1 &
+        sleep 5
         
-        # بررسی
-        curl -s http://localhost:10000 && echo "✅ Xray is running" || echo "⚠️ Xray check failed"
+        # بررسی اجرا
+        if pgrep -f xray > /dev/null; then
+          echo "✅ Xray is running"
+        else
+          echo "❌ Xray failed to start"
+          cat xray.log
+          exit 1
+        fi
         
-    - name: Setup GitHub Pages
+    - name: Create GitHub Pages Content
       run: |
+        # ایجاد پوشه Pages
         mkdir -p public
-        echo "Xray WebSocket Tunnel Active" > public/index.html
+        
+        # ایجاد فایل index.html
+        cat > public/index.html << 'EOF'
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>Xray Tunnel Status</title>
+          <meta charset="UTF-8">
+        </head>
+        <body>
+          <h1>Xray WebSocket Tunnel</h1>
+          <p>Status: Active ✅</p>
+          <p>This is a WebSocket endpoint for Xray proxy</p>
+        </body>
+        </html>
+        EOF
+        
+        # جلوگیری از پردازش Jekyll
         touch public/.nojekyll
         
-    - name: Deploy
-      uses: peaceiris/actions-gh-pages@v3
+        echo "✅ Pages content created"
+        
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v4
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_dir: ./public
         publish_branch: gh-pages
+        force_orphan: true
+        user_name: "github-actions[bot]"
+        user_email: "github-actions[bot]@users.noreply.github.com"
+        commit_message: "Deploy Xray tunnel endpoint"
         
-    - name: Show Config
+    - name: Wait for Pages Deployment
       run: |
-        DOMAIN="${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+        echo "Waiting for GitHub Pages to deploy..."
+        sleep 10
+        
+    - name: Generate VMESS Link
+      run: |
+        # آدرس Pages
+        REPO_NAME="${{ github.event.repository.name }}"
+        OWNER="${{ github.repository_owner }}"
+        DOMAIN="${OWNER}.github.io/${REPO_NAME}"
         UUID="${{ steps.config.outputs.uuid }}"
         
-        VMESS="vmess://$(echo -n "{\"v\":\"2\",\"ps\":\"Xray\",\"add\":\"$DOMAIN\",\"port\":\"443\",\"id\":\"$UUID\",\"aid\":\"0\",\"net\":\"ws\",\"path\":\"/\",\"tls\":\"tls\"}" | base64 -w 0)"
+        echo "🌐 Domain: $DOMAIN"
+        echo "🔑 UUID: $UUID"
         
-        echo "========================================="
-        echo "VMESS Link:"
-        echo "$VMESS"
-        echo "========================================="
-        echo "$VMESS" > link.txt
+        # ساخت VMESS لینک
+        VMESS_RAW=$(jq -n \
+          --arg v "2" \
+          --arg ps "Xray-GitHub" \
+          --arg add "$DOMAIN" \
+          --arg port "443" \
+          --arg id "$UUID" \
+          --arg aid "0" \
+          --arg net "ws" \
+          --arg type "none" \
+          --arg host "$DOMAIN" \
+          --arg path "/" \
+          --arg tls "tls" \
+          '{v: $v, ps: $ps, add: $add, port: $port, id: $id, aid: $aid, net: $net, type: $type, host: $host, path: $path, tls: $tls}')
         
-        sleep 21600
+        VMESS_LINK="vmess://$(echo -n $VMESS_RAW | base64 -w 0)"
         
-    - name: Upload
+        echo "=========================================="
+        echo "✅ Xray Tunnel Ready"
+        echo "=========================================="
+        echo ""
+        echo "📡 VMESS Link (Copy this):"
+        echo "$VMESS_LINK"
+        echo ""
+        echo "📋 Details:"
+        echo "   Address: $DOMAIN"
+        echo "   Port: 443"
+        echo "   UUID: $UUID"
+        echo "   Network: WebSocket (ws)"
+        echo "   Path: /"
+        echo "   TLS: Enabled"
+        echo ""
+        
+        # ذخیره در فایل
+        echo "$VMESS_LINK" > vmess_link.txt
+        echo "$DOMAIN" > domain.txt
+        
+        # نمایش QR Code
+        echo "📱 QR Code:"
+        qrencode -t ansiutf8 "$VMESS_LINK" 2>/dev/null || echo "QR code generation skipped"
+        
+    - name: Keep Tunnel Alive
+      run: |
+        echo "=========================================="
+        echo "🟢 Tunnel is Active for 6 Hours"
+        echo "=========================================="
+        echo ""
+        echo "Use the VMESS link in your V2Ray/Xray client"
+        echo ""
+        echo "To stop this workflow, cancel it from GitHub Actions"
+        echo ""
+        
+        # نمایش زمان باقی مانده هر دقیقه
+        for i in {1..360}; do
+          echo "[$(date '+%H:%M:%S')] Tunnel active - $((360 - i)) minutes remaining"
+          sleep 60
+        done
+        
+    - name: Upload Artifacts
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: config
-        path: link.txt
+        name: xray-config
+        path: |
+          vmess_link.txt
+          domain.txt
+          config.json
+        retention-days: 1
